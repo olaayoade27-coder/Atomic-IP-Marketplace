@@ -380,3 +380,114 @@ export async function getUsdcBalance(address: string): Promise<number> {
   const raw = StellarSdk.scValToNative(retval);
   return Number(raw) / Math.pow(10, USDC_DECIMALS);
 }
+
+// ─── ZK Verifier ──────────────────────────────────────────────────────────────
+
+const ZK_VERIFIER_CONTRACT_ID = import.meta.env.VITE_CONTRACT_ZK_VERIFIER ?? "";
+
+async function simulateZkView(
+  functionName: string,
+  args: import("@stellar/stellar-sdk").xdr.ScVal[]
+) {
+  if (!ZK_VERIFIER_CONTRACT_ID) throw new Error("VITE_CONTRACT_ZK_VERIFIER is not configured.");
+  const server = new StellarSdk.SorobanRpc.Server(RPC_URL);
+  const keypair = StellarSdk.Keypair.random();
+  const account = new StellarSdk.Account(keypair.publicKey(), "0");
+  const contract = new StellarSdk.Contract(ZK_VERIFIER_CONTRACT_ID);
+  const tx = new StellarSdk.TransactionBuilder(account, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: networkPassphrase(),
+  })
+    .addOperation(contract.call(functionName, ...args))
+    .setTimeout(30)
+    .build();
+  const result = await server.simulateTransaction(tx);
+  if (StellarSdk.SorobanRpc.Api.isSimulationError(result)) {
+    throw new Error(`Simulation failed: ${result.error}`);
+  }
+  return result.result?.retval;
+}
+
+/**
+ * Call set_merkle_root on the zk_verifier contract.
+ * @param listingId - listing ID (u64)
+ * @param rootHex   - 32-byte Merkle root as a 64-char hex string
+ * @param wallet    - connected wallet
+ */
+export async function setMerkleRoot(
+  listingId: number,
+  rootHex: string,
+  wallet: { address: string; signTransaction: (xdr: string) => Promise<string> }
+): Promise<void> {
+  if (!ZK_VERIFIER_CONTRACT_ID) throw new Error("VITE_CONTRACT_ZK_VERIFIER is not configured.");
+  const rootBytes = Buffer.from(rootHex.replace(/^0x/, ""), "hex");
+  if (rootBytes.length !== 32) throw new Error("Root must be exactly 32 bytes (64 hex chars).");
+
+  const server = new StellarSdk.SorobanRpc.Server(RPC_URL);
+  const sourceAccount = await server.getAccount(wallet.address);
+  const contract = new StellarSdk.Contract(ZK_VERIFIER_CONTRACT_ID);
+
+  const tx = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: networkPassphrase(),
+  })
+    .addOperation(
+      contract.call(
+        "set_merkle_root",
+        StellarSdk.nativeToScVal(new StellarSdk.Address(wallet.address), { type: "address" }),
+        StellarSdk.nativeToScVal(listingId, { type: "u64" }),
+        StellarSdk.xdr.ScVal.scvBytes(rootBytes)
+      )
+    )
+    .setTimeout(30)
+    .build();
+
+  await submitAndPoll(tx, wallet, server);
+}
+
+export interface ProofNode {
+  sibling: string; // 32-byte hex
+  is_left: boolean;
+}
+
+/**
+ * Call verify_partial_proof on the zk_verifier contract (simulation only).
+ * @param listingId - listing ID (u64)
+ * @param leafHex   - leaf data as hex string
+ * @param path      - array of ProofNode
+ * @returns boolean
+ */
+export async function verifyPartialProof(
+  listingId: number,
+  leafHex: string,
+  path: ProofNode[]
+): Promise<boolean> {
+  const leafBytes = Buffer.from(leafHex.replace(/^0x/, ""), "hex");
+
+  // Build Vec<ProofNode> as ScVal
+  const pathScVal = StellarSdk.xdr.ScVal.scvVec(
+    path.map((node) => {
+      const siblingBytes = Buffer.from(node.sibling.replace(/^0x/, ""), "hex");
+      return StellarSdk.xdr.ScVal.scvMap([
+        new StellarSdk.xdr.ScMapEntry({
+          key: StellarSdk.xdr.ScVal.scvSymbol("is_left"),
+          val: StellarSdk.xdr.ScVal.scvBool(node.is_left),
+        }),
+        new StellarSdk.xdr.ScMapEntry({
+          key: StellarSdk.xdr.ScVal.scvSymbol("sibling"),
+          val: StellarSdk.xdr.ScVal.scvBytes(siblingBytes),
+        }),
+      ]);
+    })
+  );
+
+  const retval = await simulateZkView("verify_partial_proof", [
+    StellarSdk.nativeToScVal(listingId, { type: "u64" }),
+    StellarSdk.xdr.ScVal.scvBytes(leafBytes),
+    pathScVal,
+  ]);
+
+  if (!retval) return false;
+  const native = StellarSdk.scValToNative(retval);
+  return Boolean(native);
+}
