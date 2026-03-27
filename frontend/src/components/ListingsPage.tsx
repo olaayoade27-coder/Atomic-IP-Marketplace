@@ -1,6 +1,6 @@
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
-import { ShoppingCart, Loader2, AlertTriangle, Search, Filter } from "lucide-react";
+import { ShoppingCart, Loader2, Search, Filter } from "lucide-react";
 import { useDebounce } from "../lib/debounce";
 
 interface Listing {

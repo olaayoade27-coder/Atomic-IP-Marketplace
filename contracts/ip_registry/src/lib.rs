@@ -4,8 +4,8 @@ use soroban_sdk::{
     panic_with_error, Address, Bytes, Env, Vec,
 };
 
-/// Entry for batch IP registration: (ipfs_hash, merkle_root)
-pub type IpEntry = (Bytes, Bytes);
+/// Entry for batch IP registration: (ipfs_hash, merkle_root, royalty_bps, royalty_recipient, price_usdc)
+pub type IpEntry = (Bytes, Bytes, u32, Address, i128);
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -86,13 +86,12 @@ pub struct IpDeregistered {
 }
 
 #[contractevent]
-pub struct IpRegistered {
+pub struct ListingRegistered {
     #[topic]
     pub listing_id: u64,
     #[topic]
     pub owner: Address,
     pub ipfs_hash: Bytes,
-    pub merkle_root: Bytes,
 }
 
 #[contractevent]
@@ -303,11 +302,10 @@ impl IpRegistry {
             .instance()
             .extend_ttl(cfg.ttl_threshold, cfg.ttl_extend_to);
 
-        IpRegistered {
+        ListingRegistered {
             listing_id: id,
             owner,
             ipfs_hash,
-            merkle_root,
         }
         .publish(&env);
 
@@ -318,9 +316,12 @@ impl IpRegistry {
         assert_not_paused(&env);
         let mut i: u32 = 0;
         while i < entries.len() {
-            let (ipfs_hash, merkle_root) = entries.get(i).unwrap();
-            if ipfs_hash.is_empty() || merkle_root.is_empty() {
+            let (ipfs_hash, merkle_root, royalty_bps, _royalty_recipient, price_usdc) = entries.get(i).unwrap();
+            if ipfs_hash.is_empty() || merkle_root.is_empty() || price_usdc < 0 || royalty_bps > 10_000 {
                 panic_with_error!(&env, ContractError::InvalidInput);
+            }
+            if price_usdc <= 0 {
+                panic_with_error!(&env, ContractError::InvalidPrice);
             }
             i += 1;
         }
@@ -334,7 +335,7 @@ impl IpRegistry {
 
         let mut j: u32 = 0;
         while j < entries.len() {
-            let (ipfs_hash, merkle_root) = entries.get(j).unwrap();
+            let (ipfs_hash, merkle_root, royalty_bps, royalty_recipient, price_usdc) = entries.get(j).unwrap();
 
             let prev: u64 = env
                 .storage()
@@ -354,9 +355,9 @@ impl IpRegistry {
                     owner: owner.clone(),
                     ipfs_hash: ipfs_hash.clone(),
                     merkle_root: merkle_root.clone(),
-                    royalty_bps: 0,
-                    royalty_recipient: owner.clone(),
-                    price_usdc: 0,
+                    royalty_bps,
+                    royalty_recipient,
+                    price_usdc,
                 },
             );
             extend_persistent(&env, &key, &cfg);
@@ -375,11 +376,10 @@ impl IpRegistry {
             ipfs_hashes.push_back(ipfs_hash.clone());
             merkle_roots.push_back(merkle_root.clone());
 
-            IpRegistered {
+            ListingRegistered {
                 listing_id: id,
                 owner: owner.clone(),
                 ipfs_hash,
-                merkle_root,
             }
             .publish(&env);
 
@@ -828,10 +828,16 @@ mod test {
         entries.push_back((
             Bytes::from_slice(&env, b"QmHash1"),
             Bytes::from_slice(&env, b"root1"),
+            500,
+            owner.clone(),
+            1000,
         ));
         entries.push_back((
             Bytes::from_slice(&env, b"QmHash2"),
             Bytes::from_slice(&env, b"root2"),
+            500,
+            owner.clone(),
+            1000,
         ));
         let ids = client.batch_register_ip(&owner, &entries);
         assert_eq!(ids.len(), 2);
@@ -855,7 +861,7 @@ mod test {
         let (env, client, _admin) = setup();
         let owner = Address::generate(&env);
         let mut entries: Vec<IpEntry> = Vec::new(&env);
-        entries.push_back((Bytes::new(&env), Bytes::from_slice(&env, b"root")));
+        entries.push_back((Bytes::new(&env), Bytes::from_slice(&env, b"root"), 500, owner.clone(), 1000));
         assert!(client.try_batch_register_ip(&owner, &entries).is_err());
     }
 
@@ -867,8 +873,11 @@ mod test {
         entries.push_back((
             Bytes::from_slice(&env, b"QmHash1"),
             Bytes::from_slice(&env, b"root1"),
+            500,
+            owner.clone(),
+            1000,
         ));
-        entries.push_back((Bytes::new(&env), Bytes::from_slice(&env, b"root2")));
+        entries.push_back((Bytes::new(&env), Bytes::from_slice(&env, b"root2"), 500, owner.clone(), 1000));
         assert!(client.try_batch_register_ip(&owner, &entries).is_err());
         assert_eq!(client.listing_count(), 0);
     }
@@ -911,10 +920,16 @@ mod test {
         entries.push_back((
             Bytes::from_slice(&env, b"QmHash1"),
             Bytes::from_slice(&env, b"root1"),
+            500,
+            owner.clone(),
+            1000,
         ));
         entries.push_back((
             Bytes::from_slice(&env, b"QmHash2"),
             Bytes::from_slice(&env, b"root2"),
+            500,
+            owner.clone(),
+            1000,
         ));
         client.batch_register_ip(&owner, &entries);
         // Events are emitted; verify no panic and count is correct.
@@ -1101,5 +1116,39 @@ mod test {
         client.pause();
         // Get should succeed even when paused (read-only operation)
         assert!(client.get_listing(&id).is_some());
+    }
+
+    #[test]
+    fn test_register_ip_emits_listing_registered() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let hash = b"QmHash";
+        let root = b"root";
+        let price = 1000i128;
+
+        client.register_ip(
+            &owner,
+            &Bytes::from_slice(&env, hash),
+            &Bytes::from_slice(&env, root),
+            &0u32,
+            &owner,
+            &price,
+        );
+
+        let events = env.events().all().filter_by_contract(&client.address);
+        let event = events.events().last().expect("event should be emitted");
+
+        // topics[0] is the symbol of the event struct name
+        assert_eq!(
+            event.1.get(0).unwrap(),
+            soroban_sdk::Symbol::new(&env, "ListingRegistered").into_val(&env)
+        );
+        // topics[1] is listing_id
+        assert_eq!(event.1.get(1).unwrap(), 1u64.into_val(&env));
+        // topics[2] is owner
+        assert_eq!(event.1.get(2).unwrap(), owner.into_val(&env));
+
+        // value contains the non-topic fields
+        assert_eq!(event.2, Bytes::from_slice(&env, hash).into_val(&env));
     }
 }
